@@ -1,3 +1,6 @@
+# TODO: Create csr keys also automatically
+# TODO: Wait for DNS record to created
+
 Role Name
 =========
 
