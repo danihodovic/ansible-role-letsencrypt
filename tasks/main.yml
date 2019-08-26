@@ -1,127 +1,107 @@
 ---
-# yamllint disable rule:line-length
-- name: Create letsencrypt certificates
-  gather_facts: false
-  hosts: localhost
-  vars:
-    ansible_become: true
-    acme_directory: https://acme-v02.api.letsencrypt.org/directory
-    csr_key_path: /tmp/csr.key
-    output_dir: '{{ playbook_dir }}'
-    vault_file_path: group_vars/all/ssl_certs_vault.yml
-  vars_prompt:
-    - name: cloudflare_email
-      prompt: cloudflare_email
-      private: false
-    - name: cloudflare_token
-      prompt: cloudflare_token
-    - name: acme_email
-      prompt: acme_email
-      private: false
-  tasks:
-    - set_fact:
-        # https://github.com/ansible/ansible/issues/30901#issuecomment-356824027
-        inventory_dir: '{{ ansible_inventory_sources[0] }}'
+- set_fact:
+    # https://github.com/ansible/ansible/issues/30901#issuecomment-356824027
+    inventory_dir: '{{ ansible_inventory_sources[0] }}'
 
-    - set_fact:
-        vault_file: '{{ inventory_dir }}/{{ vault_file_path }}'
+- set_fact:
+    vault_file: '{{ inventory_dir }}/{{ vault_file_path }}'
 
-    - name: Install pyOpenSSL
-      pip:
-        name: pyOpenSSL
+- name: Install pyOpenSSL
+  pip:
+    name: pyOpenSSL
 
-    - name: Place the csr creator key on disk
+- name: Place the csr creator key on disk
+  copy:
+    content: '{{ acme_csr_key }}'
+    dest: '{{ csr_key_path }}'
+
+- name: Remove the csr key regardless of errors
+  block:
+    - name: Generate csr
+      openssl_csr:
+        path: '{{ playbook_dir }}/{{ domain }}.csr'
+        privatekey_path: '{{ csr_key_path }}'
+        common_name: '{{ domain }}'
+
+    - name: Create acme account
+      acme_account:
+        acme_version: 2
+        acme_directory: '{{ acme_directory }}'
+        state: present
+        account_key_content: '{{ acme_account_key }}'
+        terms_agreed: true
+        contact:
+          - 'mailto:{{ acme_email }}'
+
+    - name: Create an acme challenge
+      acme_certificate:
+        acme_directory: '{{ acme_directory }}'
+        acme_version: 2
+        account_email: '{{ acme_email }}'
+        account_key_content: '{{ acme_account_key }}'
+        csr: '{{ playbook_dir }}/{{ domain }}.csr'
+        dest: '{{ playbook_dir }}/{{ domain }}.crt'
+        challenge: dns-01
+        force: true
+      register: challenge
+
+    - name: Create the cloudflare dns record
+      cloudflare_dns: &cloudflare_attrs
+        zone: '{{ domain }}'
+        record: "{{ challenge.challenge_data[domain]['dns-01'].record }}"
+        type: TXT
+        ttl: 1
+        value: "{{ challenge.challenge_data[domain]['dns-01'].resource_value }}"
+        account_email: '{{ cloudflare_email }}'
+        account_api_token: '{{ cloudflare_token }}'
+
+    # Wrap this in a try catch with the above...
+    # Or delete all existing ACME challenges :thinking face:
+    - name: Let the challenge be validated and retrieve the cert and intermediate certificate
+      acme_certificate:
+        acme_directory: '{{ acme_directory }}'
+        acme_version: 2
+        account_email: '{{ acme_email }}'
+        account_key_content: '{{ acme_account_key }}'
+        src: '{{ playbook_dir }}/{{ domain }}.csr'
+        dest: '{{ playbook_dir }}/{{ domain }}.crt'
+        chain_dest: '{{ playbook_dir }}/{{ domain }}-intermediate.crt'
+        fullchain_dest: '{{ playbook_dir }}/{{ domain }}-fullchain.crt'
+        challenge: dns-01
+        data: '{{ challenge }}'
+        force: true
+
+    - name: Read the certificate files
+      set_fact:
+        ssl_vars:
+          vault_ssl_csr: '{{ lookup("file", domain + ".csr") }}'
+          vault_ssl_crt: '{{ lookup("file", domain + ".crt") }}'
+          vault_ssl_intermediate_crt: '{{ lookup("file", domain + "-intermediate.crt") }}'
+          vault_ssl_fullchain_crt: '{{ lookup("file", domain + "-fullchain.crt") }}'
+
+    - name: Create the certificate vault file
       copy:
-        content: '{{ acme_csr_key }}'
-        dest: '{{ csr_key_path }}'
+        dest: '{{ vault_file }}'
+        remote_src: false
+        content: '{{ ssl_vars | to_yaml }}'
 
-    - name: Remove the csr key regardless of errors
-      block:
-        - name: Generate csr
-          openssl_csr:
-            path: '{{ playbook_dir }}/{{ domain }}.csr'
-            privatekey_path: '{{ csr_key_path }}'
-            common_name: '{{ domain }}'
+    - name: Remove the certificate files
+      file:
+        state: absent
+        path: '{{ item }}'
+      loop:
+        - '{{ domain }}.csr'
+        - '{{ domain }}.crt'
+        - '{{ domain }}-intermediate.crt'
+        - '{{ domain }}-fullchain.crt'
 
-        - name: Create acme account
-          acme_account:
-            acme_version: 2
-            acme_directory: '{{ acme_directory }}'
-            state: present
-            account_key_content: '{{ acme_account_key }}'
-            terms_agreed: true
-            contact:
-              - 'mailto:{{ acme_email }}'
+    - debug:
+        msg: |
+          Successfully generated certificates.
+          Make sure to encrypt your ssl vault files and redeploy nginx.
 
-        - name: Create an acme challenge
-          acme_certificate:
-            acme_directory: '{{ acme_directory }}'
-            acme_version: 2
-            account_email: '{{ acme_email }}'
-            account_key_content: '{{ acme_account_key }}'
-            csr: '{{ playbook_dir }}/{{ domain }}.csr'
-            dest: '{{ playbook_dir }}/{{ domain }}.crt'
-            challenge: dns-01
-            force: true
-          register: challenge
-
-        - name: Create the cloudflare dns record
-          cloudflare_dns: &cloudflare_attrs
-            zone: '{{ domain }}'
-            record: "{{ challenge.challenge_data[domain]['dns-01'].record }}"
-            type: TXT
-            ttl: 1
-            value: "{{ challenge.challenge_data[domain]['dns-01'].resource_value }}"
-            account_email: '{{ cloudflare_email }}'
-            account_api_token: '{{ cloudflare_token }}'
-
-        # Wrap this in a try catch with the above...
-        # Or delete all existing ACME challenges :thinking face:
-        - name: Let the challenge be validated and retrieve the cert and intermediate certificate
-          acme_certificate:
-            acme_directory: '{{ acme_directory }}'
-            acme_version: 2
-            account_email: '{{ acme_email }}'
-            account_key_content: '{{ acme_account_key }}'
-            src: '{{ playbook_dir }}/{{ domain }}.csr'
-            dest: '{{ playbook_dir }}/{{ domain }}.crt'
-            chain_dest: '{{ playbook_dir }}/{{ domain }}-intermediate.crt'
-            fullchain_dest: '{{ playbook_dir }}/{{ domain }}-fullchain.crt'
-            challenge: dns-01
-            data: '{{ challenge }}'
-            force: true
-
-        - name: Read the certificate files
-          set_fact:
-            ssl_vars:
-              vault_ssl_csr: '{{ lookup("file", domain + ".csr") }}'
-              vault_ssl_crt: '{{ lookup("file", domain + ".crt") }}'
-              vault_ssl_intermediate_crt: '{{ lookup("file", domain + "-intermediate.crt") }}'
-              vault_ssl_fullchain_crt: '{{ lookup("file", domain + "-fullchain.crt") }}'
-
-        - name: Create the certificate vault file
-          copy:
-            dest: '{{ vault_file }}'
-            remote_src: false
-            content: '{{ ssl_vars | to_yaml }}'
-
-        - name: Remove the certificate files
-          file:
-            state: absent
-            path: '{{ item }}'
-          loop:
-            - '{{ domain }}.csr'
-            - '{{ domain }}.crt'
-            - '{{ domain }}-intermediate.crt'
-            - '{{ domain }}-fullchain.crt'
-
-        - debug:
-            msg: |
-              Successfully generated certificates.
-              Make sure to encrypt your ssl vault files and redeploy nginx.
-
-      rescue:
-        - name: Remove csr key from disk
-          file:
-            state: absent
-            path: '{{ csr_key_path }}'
+  rescue:
+    - name: Remove csr key from disk
+      file:
+        state: absent
+        path: '{{ csr_key_path }}'
